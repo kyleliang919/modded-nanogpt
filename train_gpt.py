@@ -637,7 +637,11 @@ for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for opt in optimizers:
-        opt.step()
+        if type(opt) is AdamW:
+           optimizer1_step_fn()
+        else:
+           opt.step()
+        # opt.step()
     model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
