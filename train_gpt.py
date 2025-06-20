@@ -595,7 +595,7 @@ optimizer1 = AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
 @torch.compile(fullgraph=False)
 def optimizer1_step_fn():
     optimizer1.step()
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = C_Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
