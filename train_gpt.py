@@ -592,9 +592,6 @@ adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0
 # optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
 from c_adamw import AdamW
 optimizer1 = AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-@torch.compile(fullgraph=False)
-def optimizer1_step_fn():
-    optimizer1.step()
 optimizer2 = C_Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
@@ -637,11 +634,7 @@ for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
     model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
     for opt in optimizers:
-        if type(opt) is AdamW:
-           optimizer1_step_fn()
-        else:
-           opt.step()
-        # opt.step()
+        opt.step()
     model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
@@ -797,10 +790,7 @@ for step in range(train_steps + 1):
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
-        if type(opt) is AdamW:
-            optimizer1_step_fn()
-        else:
-            opt.step()
+        opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
