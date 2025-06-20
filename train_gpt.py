@@ -208,7 +208,7 @@ def cautious_update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
-    mask = (v * grad > 0).to(grad.dtype)
+    mask = (v * grad > 0).to(v.dtype)
     mask.div_(mask.mean().clamp_(min=1e-3))
     v = v * mask
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
