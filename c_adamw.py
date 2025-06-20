@@ -1,107 +1,113 @@
-import triton
-import triton.language as tl
+# copy dependencies from transformers/optimization.py
+import math
+import warnings
+from typing import Callable, Iterable, Tuple
+
 import torch
-from torch.optim.optimizer import Optimizer
+from torch import nn
+from torch.optim import Optimizer
 
-@triton.jit
-def fused_c_adamw_kernel(
-    param_ptr, grad_ptr, m_ptr, v_ptr,
-    lr, beta1, beta2, eps, weight_decay,
-    step, correct_bias,
-    BLOCK_SIZE: tl.constexpr,
-    n_elements: int
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+from transformers.utils.versions import require_version
 
-    p = tl.load(param_ptr + offsets, mask=mask)
-    g = tl.load(grad_ptr + offsets, mask=mask)
-    m = tl.load(m_ptr + offsets, mask=mask)
-    v = tl.load(v_ptr + offsets, mask=mask)
 
-    # Update moments
-    m_new = beta1 * m + (1 - beta1) * g
-    v_new = beta2 * v + (1 - beta2) * g * g
+class AdamW(Optimizer):
+    """
+    Implements Adam algorithm with weight decay fix as introduced in [Decoupled Weight Decay
+    Regularization](https://arxiv.org/abs/1711.05101).
 
-    if correct_bias:
-        step_f = tl.full([1], step, tl.float32)
-        bias_correction1 = 1.0 - beta1 ** step_f
-        bias_correction2 = 1.0 - beta2 ** step_f
-        m_hat = m_new / bias_correction1
-        v_hat = v_new / bias_correction2
-    else:
-        m_hat = m_new
-        v_hat = v_new
+    Parameters:
+        params (`Iterable[nn.parameter.Parameter]`):
+            Iterable of parameters to optimize or dictionaries defining parameter groups.
+        lr (`float`, *optional*, defaults to 0.001):
+            The learning rate to use.
+        betas (`Tuple[float,float]`, *optional*, defaults to `(0.9, 0.999)`):
+            Adam's betas parameters (b1, b2).
+        eps (`float`, *optional*, defaults to 1e-06):
+            Adam's epsilon for numerical stability.
+        weight_decay (`float`, *optional*, defaults to 0.0):
+            Decoupled weight decay to apply.
+        correct_bias (`bool`, *optional*, defaults to `True`):
+            Whether or not to correct bias in Adam (for instance, in Bert TF repository they use `False`).
+        no_deprecation_warning (`bool`, *optional*, defaults to `False`):
+            A flag used to disable the deprecation warning (set to `True` to disable the warning).
+    """
 
-    denom = tl.sqrt(v_hat) + eps
-
-    # Gradient normalization trick from HF
-    mask_pos = (m_hat * g > 0).to(tl.float32)
-    mask_norm = mask_pos / tl.maximum(mask_pos.sum(), 1.0)
-    update = (m_hat * mask_norm) / denom
-
-    # Apply weight decay
-    update += weight_decay * p
-
-    # Update param
-    p_new = p - lr * update
-
-    # Store
-    tl.store(param_ptr + offsets, p_new, mask=mask)
-    tl.store(m_ptr + offsets, m_new, mask=mask)
-    tl.store(v_ptr + offsets, v_new, mask=mask)
-
-class FusedCAdamW(Optimizer):
     def __init__(
         self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.01,
-        correct_bias=True
+        params: Iterable[nn.parameter.Parameter],
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        correct_bias: bool = True,
     ):
-        defaults = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, correct_bias=correct_bias
-        )
+        require_version("torch>=1.5.0")  # add_ with alpha
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr} - should be >= 0.0")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter: {betas[0]} - should be in [0.0, 1.0)")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter: {betas[1]} - should be in [0.0, 1.0)")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps} - should be >= 0.0")
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias}
         super().__init__(params, defaults)
-        self._step = 0
+        self.init_lr = lr
 
     @torch.no_grad()
-    def step(self, closure=None):
-        loss = closure() if closure is not None else None
-        self._step += 1
+    def step(self, closure: Callable = None):
+        """
+        Performs a single optimization step.
+
+        Arguments:
+            closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
 
         for group in self.param_groups:
-            for p in group["params"]:
+            for i, p in enumerate(group["params"]):
                 if p.grad is None:
                     continue
+
                 grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("FusedHFAdamW does not support sparse gradients.")
-
                 state = self.state[p]
-                if len(state) == 0:
-                    state["exp_avg"] = torch.zeros_like(p)
-                    state["exp_avg_sq"] = torch.zeros_like(p)
 
-                m, v = state["exp_avg"], state["exp_avg_sq"]
+                if "step" not in state:
+                    state["step"] = 0
 
-                n = p.numel()
-                BLOCK_SIZE = 1024
-                grid = lambda META: (triton.cdiv(n, META['BLOCK_SIZE']),)
+                # State initialization
+                if "exp_avg" not in state:
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(grad)
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.zeros_like(grad)
 
-                fused_c_adamw_kernel[grid](
-                    p, grad, m, v,
-                    group["lr"],
-                    group["betas"][0],
-                    group["betas"][1],
-                    group["eps"],
-                    group["weight_decay"],
-                    self._step,
-                    int(group["correct_bias"]),
-                    BLOCK_SIZE=BLOCK_SIZE,
-                    n_elements=n
-                )
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+
+                state["step"] += 1
+
+                # apply weight decay
+                if group["weight_decay"] > 0.0:
+                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+
+                # Decay the first and second moment running average coefficient
+                # In-place operations to update the averages at the same time
+                exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                step_size = group["lr"]
+                if group["correct_bias"]:  # No bias correction for Bert
+                    bias_correction1 = 1.0 - beta1 ** state["step"]
+                    bias_correction2 = 1.0 - beta2 ** state["step"]
+                    step_size = step_size / bias_correction1
+
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
+                # compute norm gradient
+                mask = (exp_avg * grad > 0).to(grad.dtype)
+                mask.div_(mask.mean().clamp_(min=1e-3))
+                norm_grad = (exp_avg * mask) / denom
+                p.add_(norm_grad, alpha=-step_size)
         return loss

@@ -495,8 +495,11 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
 # optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 
-from c_adamw import FusedCAdamW
-optimizer1 = FusedCAdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+from c_adamw import AdamW
+optimizer1 = AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+@torch.compile(fullgraph=False)
+def optimizer1_step_fn():
+    optimizer1.step()
 optimizer2 = C_Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
@@ -543,7 +546,10 @@ for _ in range(warmup_steps):
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     for opt in optimizers:
-        opt.step()
+        if type(opt) is AdamW:
+            optimizer1_step_fn()
+        else:
+            opt.step()
     model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
