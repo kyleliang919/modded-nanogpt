@@ -262,13 +262,13 @@ class C_Muon(torch.optim.Optimizer):
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                     mask = (g * p.grad > 0).to(g.dtype)
                     mask.div_(mask.mean().clamp_(min=1e-3))
-                    g = g * mask
+                    g = (g * mask).flatten()
                 else:
                     g = update_buffer_views[self.rank]
-                    
+
                 if base_i > 0:
                     update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
