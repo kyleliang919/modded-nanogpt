@@ -17,12 +17,11 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
+@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -56,18 +55,14 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
-@torch.compile
-def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
-    assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
-    grad = grad.float()
-    momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
-    v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
-
-    acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
-    acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
-    acc_m_u32.view(torch.float32).add_(other=v, alpha=-eff_lr)
-    acc_bf16_view_u16.copy_((acc_m_u32 >> 16).to(torch.uint16))
-    mantissa.copy_(acc_m_u32.to(torch.uint16))
+def muon_update(grad, momentum, beta=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for the case of conv filters
+        update = update.view(len(update), -1)
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
 
 class Muon(torch.optim.Optimizer):
     """
@@ -77,41 +72,40 @@ class Muon(torch.optim.Optimizer):
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+    matrix. For efficient orthogonalization we use a Newton-Schulz iteration, which has the
+    advantage that it can be stably run in bfloat16 on the GPU.
 
-    Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
+    Muon should only be used for hidden weight layers. The input embedding, final output layer,
+    and any internal gains or biases should be optimized using a standard method such as AdamW.
+    Hidden convolutional weights can be trained using Muon by viewing them as 2D and then
+    collapsing their last 3 dimensions.
+
+    Arguments:
+        lr: The learning rate, in units of spectral norm per update.
+        weight_decay: The AdamW-style weight decay.
+        momentum: The momentum. A value of 0.95 here is usually fine.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
-        self.rank = rank
-        self.world_size = world_size
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
         super().__init__(params, defaults)
-        assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
 
     @torch.no_grad()
     def step(self):
-        futures: list[torch.Future] = []
         for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * self.world_size
-            momentum = torch._as_tensor_fullprec(group["momentum"])
-            for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
+            for base_i in range(len(params))[::dist.get_world_size()]:
+                if base_i + dist.get_rank() < len(params):
+                    p = params[base_i + dist.get_rank()]
                     state = self.state[p]
                     if len(state) == 0:
-                        state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
-                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
-                    update(
-                        p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
-                        p.grad, momentum,
-                        eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
-                        eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
-                    )
-                futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
-        torch.futures.collect_all(futures).wait()
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -152,7 +146,7 @@ class CausalSelfAttention(nn.Module):
         hdim = num_heads * head_dim
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkvo_w = nn.Parameter(init_linear(torch.empty(4, hdim, dim)).bfloat16())
+        self.qkvo_w = nn.Parameter(init_linear(torch.empty(4, hdim, dim)))
         self.qkvo_w.detach()[3].zero_() # out zero init suggested by @Grad62304977
         self.rotary = Rotary(head_dim, max_seq_len)
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
@@ -162,7 +156,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1).bfloat16()).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
@@ -172,22 +166,20 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w[3])
+        y = F.linear(y, self.qkvo_w[3].bfloat16())
         return y
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.fc_w = nn.Parameter(init_linear(torch.empty(hdim, dim)).bfloat16())
-        self.proj_w = nn.Parameter(torch.zeros(dim, hdim).bfloat16())
-        self.fc_w.wd_mul = 2.0
-        self.proj_w.wd_mul = 2.0
+        self.fc_w = nn.Parameter(init_linear(torch.empty(hdim, dim)))
+        self.proj_w = nn.Parameter(torch.zeros(dim, hdim))
 
     def forward(self, x: Tensor):
-        x = F.linear(x, self.fc_w)
+        x = F.linear(x, self.fc_w.bfloat16())
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = F.linear(x, self.proj_w)
+        x = F.linear(x, self.proj_w.bfloat16())
         return x
 
 class Block(nn.Module):
@@ -352,7 +344,7 @@ class Hyperparameters:
     train_seq_len = 64*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5960 # number of iterations to run
+    num_iterations = 6125 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -435,7 +427,7 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.025, weight_decay=0.01)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
