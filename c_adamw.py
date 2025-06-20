@@ -1,13 +1,9 @@
-# copy dependencies from transformers/optimization.py
 import math
-import warnings
 from typing import Callable, Iterable, Tuple
 
 import torch
 from torch import nn
 from torch.optim import Optimizer
-
-from transformers.utils.versions import require_version
 
 
 class AdamW(Optimizer):
@@ -41,7 +37,6 @@ class AdamW(Optimizer):
         weight_decay: float = 0.0,
         correct_bias: bool = True,
     ):
-        require_version("torch>=1.5.0")  # add_ with alpha
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr} - should be >= 0.0")
         if not 0.0 <= betas[0] < 1.0:
