@@ -99,7 +99,10 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 21 | 2.997 minutes | 21st record with new timing | 02/01/25 | [log](records/020125_RuleTweak/eff63a8c-2f7e-4fc5-97ce-7f600dae0bc7.txt) | not a new record, just re-timing #21 with the [updated rules](#timing-change-after-record-21)
 21 | 3.014 minutes | 21st record with latest torch | 05/24/25 | [log](records/052425_StableTorch/89d9f224-3b01-4581-966e-358d692335e0.txt) | not a new record, just re-timing #21 with latest torch
 22 | 2.990 minutes | [Faster gradient all-reduce](https://x.com/KonstantinWille/status/1927137223238909969) | 05/24/25 | [log](records/052425_FasterReduce/23f40b75-06fb-4c3f-87a8-743524769a35.txt) | @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad; The Enigma project
-23 | 2.979 minutes | Overlap computation and gradient communication | 05/25/25 | [log](records/052525_EvenFasterReduce/6ae86d05-5cb2-4e40-a512-63246fd08e45.txt) | @ryanyang0
+23 | 2.979 minutes | [Overlap computation and gradient communication](https://x.com/kellerjordan0/status/1927460573098262616) | 05/25/25 | [log](records/052525_EvenFasterReduce/6ae86d05-5cb2-4e40-a512-63246fd08e45.txt) | @ryanyang0
+24 | 2.966 minutes | Replace gradient all_reduce with reduce_scatter | 05/30/25 | [log](records/053025_noallreduce/8054c239-3a18-499e-b0c8-dbd27cb4b3ab.txt) | @vagrawal
+25 | 2.896 minutes | Upgrade PyTorch to 2.9.0.dev20250713+cu126 | 07/13/25 | [log](records/071325_UpgradeTorch190/692f80e0-5e64-4819-97d4-0dc83b7106b9.txt ) | @kellerjordan0
+26 | 2.863 minutes | Align training batch starts with EoS, increase cooldown frac to .45 | 07/13/25 | [log](records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt) | @ClassicLarry
 
 ## Rules
 
@@ -142,6 +145,28 @@ were in the ImageNet days.
 The only possible 'benefit' I can think of for any empirical field to abandon benchmarks is that it would make it easier to publish false results. Oh, I guess that's why it happened.
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
+
+---
+
+### Important note about records 22-25
+
+Thanks to the statistical testing of [@agrawal](https://www.github.com/agrawal) (holder of the 24th record), we have learned that records 23, 24, and in all likelihood 22 and 25, actually attain a mean loss of 3.281, which is slightly above the 3.28 target.
+Therefore if we were to completely adhere to the speedrun rules, we would have to deny that these are valid records.
+However, we have decided to leave them in place as valid, because of the following two reasons: (a) the extra loss is most likely my (@kellerjordan0) own fault rather than that of the records, and (b) it is most likely easily addressable.
+
+Here's what happened: Records #22 to #25 each change only the systems/implementation of the speedrun.
+Therefore, the requirement to do statistical testing to confirm they hit the target was waived, since in theory they should have hit it automatically, by virtue of the fact that they didn't touch the ML (i.e., they didn't change the architecture, learning rate, etc.).
+
+So if these records shouldn't have changed the ML, what explains the regression in val loss?
+We think that most likely, the answer is that this regression was indeed not introduced by any of these records. Instead, it was
+probably caused by my own non-record in which I retimed record #21 with newest torch,
+because in this non-record I also changed the constants used to cast the lm_head to fp8.
+I thought that this change should cause only a (small) strict improvement, but apparently that was not the case.
+
+Therefore, it is probable that each of records #22-25 could be easily made fully valid by simply reverting the change I made to those constants.
+Therefore they shall be upheld as valid records.
+
+For the future, fortunately record #26 brought the speedrun back into the green in terms of <3.28 loss, so (with high p-value) it should be in a good state now.
 
 ---
 
